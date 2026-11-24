@@ -33,6 +33,21 @@ THEMES = ["finding a glowing mushroom", "helping a lost baby firefly", "crossing
 def log(*a): print("[bot]", *a, flush=True)
 
 
+def pause(s): import time; time.sleep(s)
+
+
+def retry(fn, tries=6):
+    for k in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            if k == tries - 1:
+                raise
+            wait = 20 * (k + 1)
+            log(f"retry {k+1}/{tries} after error: {str(e)[:100]} - waiting {wait}s")
+            pause(wait)
+
+
 # ---------------------------------------------------------------- story
 def make_story():
     from google import genai
@@ -105,6 +120,7 @@ def make_images(story):
                 break
             except Exception as e:
                 log(f"image {i} attempt {attempt} failed: {e}")
+                pause(20)
                 if attempt == 1 and IMAGE_PROVIDER == "gemini":
                     try: img = _hf_image(full); break
                     except Exception as e2: log("hf fallback failed:", e2)
@@ -225,7 +241,7 @@ def upload(video, story, thumb):
 
 
 def main():
-    story = make_story(); log("story:", story["title_en"])
+    story = retry(make_story); log("story:", story["title_en"])
     (OUT / "story.json").write_text(json.dumps(story, ensure_ascii=False, indent=2))
     imgs = make_images(story)
     music = hf_music("cheerful playful kids cartoon music, xylophone, ukulele, upbeat") or procedural_music()
