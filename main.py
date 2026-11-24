@@ -1,9 +1,10 @@
-"""Pipeline: story (Gemini) -> images -> animated video (FFmpeg) -> music -> YouTube upload.
+"""Pipeline: story (Gemini) -> images (Cloudflare FLUX) -> animated video (FFmpeg) -> music -> YouTube upload.
 
-Env vars: GEMINI_API_KEY, HF_TOKEN (optional), YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN
-Options:  DRY_RUN=1 (no upload), PRIVACY=private|unlisted|public, IMAGE_PROVIDER=gemini|hf
+Env vars: GEMINI_API_KEY, CF_ACCOUNT_ID, CF_API_TOKEN, HF_TOKEN (optional),
+          YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN
+Options:  DRY_RUN=1 (no upload), PRIVACY=private|unlisted|public, IMAGE_PROVIDER=cf|gemini|hf
 """
-import io, json, math, os, random, subprocess, sys, wave
+import base64, io, json, math, os, random, subprocess, sys, wave
 from datetime import date
 from pathlib import Path
 
@@ -16,15 +17,16 @@ SCENE_SECONDS = 7.5          # 8 x 7.5 = 60 s
 FPS = 25
 TEXT_MODEL = os.getenv("TEXT_MODEL", "gemini-3.6-flash")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")
-IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "hf")
+IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "cf")
 HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
 PRIVACY = os.getenv("PRIVACY", "private")
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
 STYLE = ("Pixar-style 3D cartoon render, vibrant saturated colors, soft cinematic lighting, "
-         "big expressive eyes, cute and child-friendly, high detail, 16:9 wide shot")
-CHARACTER = ("a tiny fluffy cream-colored puppy named Bobo with huge round brown eyes, "
-             "floppy ears, a small red scarf and a wagging tail")
+         "cute and child-friendly, high detail, wide cinematic landscape shot, "
+         "the puppy is in the center of the frame")
+CHARACTER = ("Bobo, a small fluffy cream-colored puppy with a white chest patch, huge round brown eyes, "
+             "floppy light-brown ears, a small red scarf around his neck and a short wagging tail")
 THEMES = ["finding a glowing mushroom", "helping a lost baby firefly", "crossing a rainbow bridge",
           "meeting a friendly owl", "a treasure of shiny acorns", "dancing with forest butterflies",
           "rescuing a kite from a tree", "a picnic with bunny friends"]
@@ -59,8 +61,8 @@ Hero: {CHARACTER}. Theme today: {theme}. Seed: {date.today().isoformat()}-{rando
 Return JSON: {{"title_ar": str (<=70 chars, Arabic, catchy, child-safe),
 "title_en": str, "description_ar": str (2 short sentences), "tags": [str x8],
 "scenes": [{SCENES} objects {{"image_prompt": str, "motion": "in"|"out"}}]}}.
-Each image_prompt describes ONE clear scene in English, always featuring the hero, no text in image,
-happy mood, no scary elements. Scenes must follow a simple story: start, small problem, friends, joy."""
+Each image_prompt describes ONE clear scene in English (max 40 words), always featuring the puppy,
+no text in image, happy mood, no scary elements. Scenes must follow a simple story: start, small problem, friends, joy."""
     r = client.models.generate_content(
         model=TEXT_MODEL, contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json"))
@@ -71,6 +73,20 @@ happy mood, no scary elements. Scenes must follow a simple story: start, small p
 
 
 # ---------------------------------------------------------------- images
+def _cf_image(prompt, seed):
+    import requests
+    acc = os.environ["CF_ACCOUNT_ID"]
+    tok = os.environ["CF_API_TOKEN"]
+    url = f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+    body = {"prompt": prompt[:2000], "steps": 6, "seed": seed}
+    r = requests.post(url, headers={"Authorization": f"Bearer {tok}"}, json=body, timeout=180)
+    if r.status_code != 200:
+        raise RuntimeError(f"cloudflare {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    b64 = data["result"]["image"]
+    return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+
+
 def _gemini_image(prompt, ref_bytes=None):
     from google import genai
     from google.genai import types
@@ -108,22 +124,22 @@ def to_16x9(img, size=(2880, 1620)):
 
 def make_images(story):
     paths, ref = [], None
+    seed = random.randint(1000, 999999)
     for i, sc in enumerate(story["scenes"]):
-        full = f"{STYLE}. Hero: {CHARACTER}. Scene: {sc['image_prompt']}"
+        full = f"{CHARACTER}. {sc['image_prompt']}. {STYLE}"
         img = None
         for attempt in range(3):
             try:
-                if IMAGE_PROVIDER == "gemini":
+                if IMAGE_PROVIDER == "cf":
+                    img = _cf_image(full, seed)
+                elif IMAGE_PROVIDER == "gemini":
                     img = _gemini_image(full, ref)
                 else:
                     img = _hf_image(full)
                 break
             except Exception as e:
                 log(f"image {i} attempt {attempt} failed: {e}")
-                pause(20)
-                if attempt == 1 and IMAGE_PROVIDER == "gemini":
-                    try: img = _hf_image(full); break
-                    except Exception as e2: log("hf fallback failed:", e2)
+                pause(15)
         if img is None:
             raise RuntimeError(f"scene {i} image failed")
         if i == 0 and IMAGE_PROVIDER == "gemini":
