@@ -38,6 +38,9 @@ def log(*a): print("[bot]", *a, flush=True)
 def pause(s): import time; time.sleep(s)
 
 
+def clean(value): return "".join(str(value).split())
+
+
 def retry(fn, tries=6):
     for k in range(tries):
         try:
@@ -75,8 +78,8 @@ no text in image, happy mood, no scary elements. Scenes must follow a simple sto
 # ---------------------------------------------------------------- images
 def _cf_image(prompt, seed):
     import requests
-        acc = "".join(os.environ["CF_ACCOUNT_ID"].split())
-    tok = "".join(os.environ["CF_API_TOKEN"].split())
+    acc = clean(os.environ["CF_ACCOUNT_ID"])
+    tok = clean(os.environ["CF_API_TOKEN"])
     log(f"cf lengths: account={len(acc)} token={len(tok)}")
     url = f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/@cf/black-forest-labs/flux-1-schnell"
     body = {"prompt": prompt[:2000], "steps": 6, "seed": seed}
