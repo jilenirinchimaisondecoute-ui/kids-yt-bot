@@ -14,7 +14,7 @@ OUT = Path("output"); OUT.mkdir(exist_ok=True)
 SCENES = 8
 SCENE_SECONDS = 7.5          # 8 x 7.5 = 60 s
 FPS = 25
-TEXT_MODEL = os.getenv("TEXT_MODEL", "gemini-3.8-flash")
+TEXT_MODEL = os.getenv("TEXT_MODEL", "gemini-3.6-flash")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gemini-3.1-flash-image")
 IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "gemini")
 HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
