@@ -25,7 +25,7 @@ DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 STYLE = ("Pixar-style 3D cartoon render, vibrant saturated colors, soft cinematic lighting, "
          "cute and child-friendly, high detail, wide cinematic landscape shot, "
          "the puppy is in the center of the frame")
-CHARACTER = ("Bobo, a small fluffy cream-colored puppy with a white chest patch, huge round brown eyes, "
+CHARACTER = ("Bobo, a small fluffy cream-colored puppy with a white chest patch, huge round eyes with warm amber-brown irises and black pupils, both eyes exactly the same color, "
              "floppy light-brown ears, a small red scarf around his neck and a short wagging tail")
 THEMES = ["finding a glowing mushroom", "helping a lost baby firefly", "crossing a rainbow bridge",
           "meeting a friendly owl", "a treasure of shiny acorns", "dancing with forest butterflies",
