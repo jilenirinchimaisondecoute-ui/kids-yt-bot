@@ -76,16 +76,15 @@ no text in image, happy mood, no scary elements. Scenes must follow a simple sto
 
 
 # ---------------------------------------------------------------- images
-def _cf_image(prompt, seed):
+def _cf_image(prompt, seed=None):
     import requests
     acc = clean(os.environ["CF_ACCOUNT_ID"])
     tok = clean(os.environ["CF_API_TOKEN"])
-    log(f"cf lengths: account={len(acc)} token={len(tok)}")
     url = f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/@cf/black-forest-labs/flux-1-schnell"
-    body = {"prompt": prompt[:2000], "steps": 6, "seed": seed}
+    body = {"prompt": prompt[:2000], "steps": 6}
     r = requests.post(url, headers={"Authorization": f"Bearer {tok}"}, json=body, timeout=180)
     if r.status_code != 200:
-        raise RuntimeError(f"cloudflare {r.status_code}: {r.text[:300]}")
+        raise RuntimeError(f"cloudflare {r.status_code}: {r.text[:600]}")
     data = r.json()
     b64 = data["result"]["image"]
     return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
