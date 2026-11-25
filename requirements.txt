@@ -2,6 +2,11 @@ google-genai
 huggingface_hub
 pillow
 numpy
+requests
 google-api-python-client
 google-auth
 google-auth-oauthlib
+arabic-reshaper
+python-bidi
+edge-tts
+gTTS
