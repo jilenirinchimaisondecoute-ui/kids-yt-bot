@@ -16,6 +16,7 @@ OUT = Path("output"); OUT.mkdir(exist_ok=True)
 BPM = 120
 BEAT = 60 / BPM                  # 0.5 s
 SCENES = 15
+UNIQUE_IMAGES = 8                # one picture serves ~2 scenes (saves the free daily quota)
 SCENE_SECONDS = BEAT * 8         # 4 s = 2 bars -> 15 x 4 = 60 s
 TOTAL = SCENES * SCENE_SECONDS
 FPS = 25
@@ -126,7 +127,7 @@ def _cf_image(prompt):
     tok = clean(os.environ["CF_API_TOKEN"])
     url = f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/@cf/black-forest-labs/flux-1-schnell"
     r = requests.post(url, headers={"Authorization": f"Bearer {tok}"},
-                      json={"prompt": prompt[:2000], "steps": 6}, timeout=180)
+                      json={"prompt": prompt[:2000], "steps": 4}, timeout=180)
     if r.status_code != 200:
         raise RuntimeError(f"Cloudflare {r.status_code}: {r.text[:600]}")
     b64 = r.json()["result"]["image"]
@@ -143,27 +144,39 @@ def to_16x9(img, size=(2880, 1620)):
     return img.resize(size, Image.LANCZOS)
 
 
+def image_map():
+    """scene index -> unique image index (15 scenes share 8 pictures)."""
+    return [i * UNIQUE_IMAGES // SCENES for i in range(SCENES)]
+
+
 def make_images(story):
-    paths = []
-    for i, sc in enumerate(story["scenes"]):
-        full = f"{CHARACTER}. {sc['image_prompt']}. {STYLE}"
+    mp = image_map()
+    uniq = []                                   # scene index whose prompt draws each unique image
+    for i in range(SCENES):
+        if i == 0 or mp[i] != mp[i - 1]:
+            uniq.append(i)
+    files = []
+    for k, si in enumerate(uniq):
+        full = f"{CHARACTER}. {story['scenes'][si]['image_prompt']}. {STYLE}"
         img = None
         for attempt in range(3):
             try:
                 img = _cf_image(full)
                 break
             except Exception as e:
-                log(f"image {i} attempt {attempt} failed: {e}")
+                log(f"image {k} attempt {attempt} failed: {e}")
+                if "429" in str(e):             # daily free quota finished: do not wait
+                    break
                 pause(15)
         if img is None:
-            if not paths:
-                raise RuntimeError(f"scene {i} image failed")
-            log(f"image {i}: reusing previous image")
-            paths.append(paths[-1]); continue
-        p = OUT / f"scene_{i}.png"; to_16x9(img).save(p); paths.append(p)
-        log("image", i, "ok")
+            if not files:
+                raise RuntimeError(f"image {k} failed (Cloudflare daily quota may be used up)")
+            log(f"image {k}: reusing previous image")
+            files.append(files[-1]); continue
+        p = OUT / f"img_{k}.png"; to_16x9(img).save(p); files.append(p)
+        log("image", k, "ok")
         pause(1)
-    return paths
+    return [files[mp[i]] for i in range(SCENES)]
 
 
 # ---------------------------------------------------------------- lyrics on screen
@@ -490,13 +503,14 @@ def mix_audio(music, voices):
 
 
 # ---------------------------------------------------------------- video
-def make_video(images, mix):
+def make_video(images, mix, same_as_prev=None):
     frames = int(SCENE_SECONDS * FPS)
     beat_f = BEAT * FPS
     clips = []
     for i, img in enumerate(images):
         drift = f"0.05*on/{frames}" if i % 2 == 0 else f"0.05*(1-on/{frames})"
-        z = f"1.10+0.05*pow(cos(PI*on/{beat_f}),2)+{drift}"
+        base = 1.22 if (same_as_prev and same_as_prev[i]) else 1.10
+        z = f"{base}+0.05*pow(cos(PI*on/{beat_f}),2)+{drift}"
         s = 1 if i % 2 == 0 else -1
         x = f"(iw-iw/zoom)/2+iw*0.025*sin(2*PI*on/{frames})*{s}"
         y = f"(ih-ih/zoom)/2+ih*0.015*cos(2*PI*on/{frames})"
@@ -560,8 +574,9 @@ def main():
     music = make_music(story["title_en"])
     voices = make_voices(story)
     mix = mix_audio(music, voices)
-    video = make_video(texted, mix); log("video ready", video)
-    thumb = OUT / "thumb.jpg"; Image.open(imgs[1]).resize((1280, 720)).save(thumb, quality=90)
+    mp = image_map()
+    video = make_video(texted, mix, [i > 0 and mp[i] == mp[i - 1] for i in range(SCENES)]); log("video ready", video)
+    thumb = OUT / "thumb.jpg"; Image.open(imgs[2]).resize((1280, 720)).save(thumb, quality=90)
     if DRY_RUN:
         log("DRY_RUN: upload skipped"); return
     upload(video, story, thumb)
