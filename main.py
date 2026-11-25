@@ -62,6 +62,21 @@ def run(cmd):
 
 
 # ---------------------------------------------------------------- story + song
+def text_models(client):
+    """Preferred model first, then any other Gemini flash text model the key can use."""
+    names = [TEXT_MODEL]
+    try:
+        for m in client.models.list():
+            n = m.name.replace("models/", "")
+            acts = getattr(m, "supported_actions", None) or ["generateContent"]
+            bad = ("image", "tts", "live", "audio", "embedding", "native", "robotics", "computer")
+            if "generateContent" in acts and "flash" in n and not any(x in n for x in bad) and n not in names:
+                names.append(n)
+    except Exception as e:
+        log("model list failed:", e)
+    return names[:5]
+
+
 def make_story():
     from google import genai
     from google.genai import types
@@ -80,15 +95,28 @@ Rules for lyric_ar: the Arabic song line for that scene, simple modern Arabic th
 2 to 6 words, fun rhythm, ends with rhyme (couplets). The lyric must match what happens in that scene
 and the lines together must tell the story. Scenes 4, 8 and 12 use the SAME catchy chorus line that
 repeats the hero name Bobo (بوبو). Do not use diacritics. No English in lyrics."""
-    r = client.models.generate_content(
-        model=TEXT_MODEL, contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json"))
-    story = json.loads(r.text)
-    assert len(story["scenes"]) >= SCENES
-    story["scenes"] = story["scenes"][:SCENES]
-    for sc in story["scenes"]:
-        sc["lyric_ar"] = str(sc.get("lyric_ar", "")).strip()
-    return story
+    models = text_models(client)
+    log("text models:", models)
+    last = None
+    for rnd in range(3):
+        for model in models:
+            try:
+                r = client.models.generate_content(
+                    model=model, contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json"))
+                story = json.loads(r.text)
+                assert len(story["scenes"]) >= SCENES
+                story["scenes"] = story["scenes"][:SCENES]
+                for sc in story["scenes"]:
+                    sc["lyric_ar"] = str(sc.get("lyric_ar", "")).strip()
+                log("story model:", model)
+                return story
+            except Exception as e:
+                last = e
+                log(f"{model} failed (round {rnd + 1}): {str(e)[:160]}")
+                pause(8)
+        pause(30)
+    raise last
 
 
 # ---------------------------------------------------------------- images
@@ -339,34 +367,104 @@ def read_wav(p):
     return data
 
 
-def load_voice(src, max_len):
+def clean_wav(src):
+    """mp3 -> mono wav with leading/trailing silence removed."""
     wav = Path(str(src) + ".wav")
-    run(["ffmpeg", "-y", "-i", str(src), "-ar", str(SR), "-ac", "1",
-         "-af", "silenceremove=start_periods=1:start_threshold=-45dB", str(wav)])
+    run(["ffmpeg", "-y", "-i", str(src), "-ar", str(SR), "-ac", "1", "-af",
+         "silenceremove=start_periods=1:start_threshold=-45dB,areverse,"
+         "silenceremove=start_periods=1:start_threshold=-45dB,areverse", str(wav)])
+    return wav
+
+
+def estimate_f0(x):
+    """Median pitch (Hz) of the voiced part of a short mono signal."""
+    frame = int(0.08 * SR); hop = frame // 2
+    lo, hi = int(SR / 420), int(SR / 80)
+    f0s = []
+    for a in range(0, max(1, len(x) - frame), hop):
+        seg = x[a:a + frame]
+        if len(seg) < frame or np.sqrt(np.mean(seg ** 2)) < 0.02:
+            continue
+        seg = seg - seg.mean()
+        spec = np.fft.rfft(seg, 2 * frame)
+        ac = np.fft.irfft(spec * np.conj(spec))[:frame]
+        if ac[0] <= 0:
+            continue
+        lag = lo + int(np.argmax(ac[lo:hi]))
+        if ac[lag] / ac[0] > 0.35:
+            f0s.append(SR / lag)
+    return float(np.median(f0s)) if f0s else None
+
+
+def sing_word(wav, ratio, max_len):
+    """Shift pitch by `ratio` keeping the duration, then speed up if longer than max_len."""
     data = read_wav(wav)
     dur = len(data) / SR
-    if dur > max_len:
-        wav2 = Path(str(src) + ".fast.wav")
-        run(["ffmpeg", "-y", "-i", str(wav), "-af", f"atempo={min(dur / max_len, 1.7):.3f}", str(wav2)])
-        data = read_wav(wav2)
-    peak = np.abs(data).max()
-    return data / peak * 0.9 if peak > 0 else data
+    speed = max(1.0, dur / max_len)
+    tempo = speed / ratio
+    chain = []
+    while tempo > 2.0:
+        chain.append("atempo=2.0"); tempo /= 2.0
+    while tempo < 0.5:
+        chain.append("atempo=0.5"); tempo /= 0.5
+    chain.append(f"atempo={tempo:.4f}")
+    out = Path(str(wav) + f".{ratio:.3f}.wav")
+    run(["ffmpeg", "-y", "-i", str(wav), "-af",
+         f"asetrate={SR * ratio:.1f},aresample={SR}," + ",".join(chain), str(out)])
+    y = read_wav(out)
+    n = min(len(y), int(0.012 * SR))
+    if n > 0:
+        y[:n] *= np.linspace(0, 1, n); y[-n:] *= np.linspace(1, 0, n)
+    peak = np.abs(y).max()
+    return y / peak * 0.9 if peak > 0 else y
+
+
+# C Am F G chord tones (Hz), one list per bar of the 4-bar loop used by the music
+CHORD_TONES = [[261.63, 329.63, 392.00], [220.00, 261.63, 329.63],
+               [174.61, 220.00, 261.63], [196.00, 246.94, 293.66]]
+CONTOURS = [[0, 1, 2, 1, 2, 1], [2, 1, 0, 1, 2, 2], [0, 2, 1, 2, 0, 1]]
+
+
+def word_beats(n):
+    """Beat positions (0..7) for n words inside a 2-bar scene."""
+    return [int(i * 8 / n) for i in range(min(n, 8))]
 
 
 def make_voices(story):
-    voices, cache = [], {}
+    """Each word is synthesised alone, then pitched to a chord tone and placed on a beat (sing-song)."""
+    voices, words_cache, f0_cache = [], {}, {}
+    ok_words = 0
     for i, sc in enumerate(story["scenes"]):
-        text = sc.get("lyric_ar", "")
-        if not text:
+        words = sc.get("lyric_ar", "").split()[:8]
+        if not words:
             continue
-        if text not in cache:
-            mp3 = OUT / f"voice_{i}.mp3"
-            cache[text] = load_voice(mp3, SCENE_SECONDS - 0.5) if tts_line(text, mp3) else None
-            if cache[text] is None:
-                log(f"voice {i}: failed, scene stays music-only")
-        if cache[text] is not None:
-            voices.append((i * SCENE_SECONDS + 0.25, cache[text]))
-    log("voice lines:", len(voices), "/", SCENES)
+        beats = word_beats(len(words))
+        contour = CONTOURS[int(hashlib.md5(sc["lyric_ar"].encode()).hexdigest()[:4], 16) % 3]
+        for k, (w, beat) in enumerate(zip(words, beats)):
+            if w not in words_cache:
+                mp3 = OUT / f"w_{len(words_cache)}.mp3"
+                words_cache[w] = clean_wav(mp3) if tts_line(w, mp3) else None
+            wav = words_cache[w]
+            if wav is None:
+                continue
+            try:
+                if w not in f0_cache:
+                    f0_cache[w] = estimate_f0(read_wav(wav))
+                f0 = f0_cache[w]
+                nxt = beats[k + 1] if k + 1 < len(beats) else 8
+                max_len = (nxt - beat) * BEAT - 0.06
+                chord = CHORD_TONES[(2 * i + beat // 4) % 4]
+                if f0:
+                    tone = chord[contour[k % len(contour)]]
+                    target = tone * 2 ** round(math.log2(f0 / tone))
+                    ratio = float(np.clip(target / f0, 0.7, 1.45))
+                else:
+                    ratio = 1.0
+                voices.append((i * SCENE_SECONDS + beat * BEAT + 0.04, sing_word(wav, ratio, max_len)))
+                ok_words += 1
+            except Exception as e:
+                log(f"word '{w}' skipped: {e}")
+    log("sung words:", ok_words)
     return voices
 
 
@@ -455,7 +553,7 @@ def upload(video, story, thumb):
 
 
 def main():
-    story = retry(make_story); log("story:", story["title_en"])
+    story = make_story(); log("story:", story["title_en"])
     (OUT / "story.json").write_text(json.dumps(story, ensure_ascii=False, indent=2))
     imgs = make_images(story)
     texted = add_lyrics_all(story, imgs)
