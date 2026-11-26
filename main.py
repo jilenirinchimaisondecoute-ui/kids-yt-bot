@@ -347,19 +347,19 @@ def make_music(seed_text="bobo"):
 
 
 # ---------------------------------------------------------------- voice (Arabic chant)
-def _edge_tts(text, path, voice):
+def _edge_tts(text, path, voice, rate, pitch):
     import edge_tts
 
     async def go():
-        await edge_tts.Communicate(text, voice, rate="+8%", pitch="+25Hz").save(str(path))
+        await edge_tts.Communicate(text, voice, rate=rate, pitch=pitch).save(str(path))
     asyncio.run(go())
 
 
-def tts_line(text, path):
+def tts_line(text, path, rate="+8%", pitch="+25Hz"):
     for voice in VOICES:
         for _ in range(2):
             try:
-                _edge_tts(text, path, voice)
+                _edge_tts(text, path, voice, rate, pitch)
                 if Path(path).exists() and Path(path).stat().st_size > 1000:
                     return True
             except Exception as e:
@@ -443,7 +443,7 @@ def word_beats(n):
     return [int(i * 8 / n) for i in range(min(n, 8))]
 
 
-def make_voices(story):
+def make_voices_words(story):
     """Each word is synthesised alone, then pitched to a chord tone and placed on a beat (sing-song)."""
     voices, words_cache, f0_cache = [], {}, {}
     ok_words = 0
@@ -478,6 +478,44 @@ def make_voices(story):
             except Exception as e:
                 log(f"word '{w}' skipped: {e}")
     log("sung words:", ok_words)
+    return voices
+
+
+def fit_line(wav, lo=2.3, hi=3.5):
+    """Stretch/compress a sung line so it fills 2.3-3.5 s of its 4 s scene, add a little echo."""
+    data = read_wav(wav)
+    dur = len(data) / SR
+    target = min(max(dur, lo), hi)
+    tempo = float(np.clip(dur / target, 0.65, 1.7))
+    out = Path(str(wav) + ".fit.wav")
+    run(["ffmpeg", "-y", "-i", str(wav), "-af", f"atempo={tempo:.4f},aecho=0.8:0.6:45:0.25", str(out)])
+    y = read_wav(out)
+    n = min(len(y), int(0.02 * SR))
+    if n > 0:
+        y[:n] *= np.linspace(0, 1, n); y[-n:] *= np.linspace(1, 0, n)
+    peak = np.abs(y).max()
+    return y / peak * 0.9 if peak > 0 else y
+
+
+def make_voices(story):
+    """Whole line with natural prosody, slowed down and lifted in pitch, one line per scene (chant-song)."""
+    if os.getenv("VOICE_MODE", "line") == "words":
+        return make_voices_words(story)
+    voices, cache = [], {}
+    for i, sc in enumerate(story["scenes"]):
+        text = sc.get("lyric_ar", "")
+        if not text:
+            continue
+        if text not in cache:
+            mp3 = OUT / f"line_{len(cache)}.mp3"
+            try:
+                ok = tts_line(text, mp3, rate="-22%", pitch="+30Hz")
+                cache[text] = fit_line(clean_wav(mp3)) if ok else None
+            except Exception as e:
+                log(f"voice {i} failed: {e}"); cache[text] = None
+        if cache[text] is not None:
+            voices.append((i * SCENE_SECONDS + 0.15, cache[text]))
+    log("sung lines:", len(voices), "/", SCENES)
     return voices
 
 
