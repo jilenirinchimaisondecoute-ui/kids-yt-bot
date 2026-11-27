@@ -689,15 +689,34 @@ def upload(video, story, thumb):
     return vid
 
 
+def custom_mix():
+    """If song.mp3 / song.wav / song.m4a exists in the repo, use it as the whole soundtrack."""
+    for name in ("song.mp3", "song.wav", "song.m4a"):
+        if Path(name).exists():
+            p = OUT / "mix.wav"
+            run(["ffmpeg", "-y", "-i", name, "-t", str(TOTAL), "-ar", str(SR), "-ac", "1", str(p)])
+            log("using custom song:", name)
+            return p
+    return None
+
+
+def melody_mix(story):
+    """Instrument melody for every lyric line, on top of the beat. No synthetic voice."""
+    leads = []
+    for i, sc in enumerate(story["scenes"]):
+        text = sc.get("lyric_ar", "")
+        if text:
+            leads.extend((i * SCENE_SECONDS + t, d, f) for t, d, f in words_only_notes(text, i))
+    music = add_leads(make_music(story["title_en"]), leads, 0.5)
+    return mix_audio(music, [])
+
+
 def main():
     story = make_story(); log("story:", story["title_en"])
     (OUT / "story.json").write_text(json.dumps(story, ensure_ascii=False, indent=2))
     imgs = make_images(story)
     texted = add_lyrics_all(story, imgs)
-    music = make_music(story["title_en"])
-    voices, leads = make_voices(story)
-    music = add_leads(music, leads, 0.30 if voices else 0.45)
-    mix = mix_audio(music, voices)
+    mix = custom_mix() or melody_mix(story)
     mp = image_map()
     video = make_video(texted, mix, [i > 0 and mp[i] == mp[i - 1] for i in range(SCENES)]); log("video ready", video)
     thumb = OUT / "thumb.jpg"; Image.open(imgs[2]).resize((1280, 720)).save(thumb, quality=90)
