@@ -338,7 +338,7 @@ def make_music(seed_text="bobo"):
         for j, idx in enumerate(seq):
             if j in rests:
                 continue
-            _add(buf, b0 + j * BEAT / 2, _pluck(chords[ci][idx], 0.4), 0.26)
+            _add(buf, b0 + j * BEAT / 2, _pluck(chords[ci][idx], 0.4), 0.13)
         if bar % 2 == 0:
             _add(buf, b0, _bell(chords[ci][3] * 2), 0.07)
     buf = buf[:int(TOTAL * SR)]
@@ -409,80 +409,130 @@ def estimate_f0(x):
     return float(np.median(f0s)) if f0s else None
 
 
-def sing_word(wav, ratio, max_len):
-    """Shift pitch by `ratio` keeping the duration, then speed up if longer than max_len."""
-    data = read_wav(wav)
-    dur = len(data) / SR
-    speed = max(1.0, dur / max_len)
-    tempo = speed / ratio
-    chain = []
-    while tempo > 2.0:
-        chain.append("atempo=2.0"); tempo /= 2.0
-    while tempo < 0.5:
-        chain.append("atempo=0.5"); tempo /= 0.5
-    chain.append(f"atempo={tempo:.4f}")
-    out = Path(str(wav) + f".{ratio:.3f}.wav")
-    run(["ffmpeg", "-y", "-i", str(wav), "-af",
-         f"asetrate={SR * ratio:.1f},aresample={SR}," + ",".join(chain), str(out)])
-    y = read_wav(out)
-    n = min(len(y), int(0.012 * SR))
-    if n > 0:
-        y[:n] *= np.linspace(0, 1, n); y[-n:] *= np.linspace(1, 0, n)
-    peak = np.abs(y).max()
-    return y / peak * 0.9 if peak > 0 else y
+def write_wav(path, x):
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR)
+        w.writeframes((np.clip(x, -1, 1) * 32767).astype(np.int16).tobytes())
 
 
-# C Am F G chord tones (Hz), one list per bar of the 4-bar loop used by the music
-CHORD_TONES = [[261.63, 329.63, 392.00], [220.00, 261.63, 329.63],
-               [174.61, 220.00, 261.63], [196.00, 246.94, 293.66]]
-CONTOURS = [[0, 1, 2, 1, 2, 1], [2, 1, 0, 1, 2, 2], [0, 2, 1, 2, 0, 1]]
-
-
-def word_beats(n):
-    """Beat positions (0..7) for n words inside a 2-bar scene."""
-    return [int(i * 8 / n) for i in range(min(n, 8))]
-
-
-def make_voices_words(story):
-    """Each word is synthesised alone, then pitched to a chord tone and placed on a beat (sing-song)."""
-    voices, words_cache, f0_cache = [], {}, {}
-    ok_words = 0
-    for i, sc in enumerate(story["scenes"]):
-        words = sc.get("lyric_ar", "").split()[:8]
-        if not words:
-            continue
-        beats = word_beats(len(words))
-        contour = CONTOURS[int(hashlib.md5(sc["lyric_ar"].encode()).hexdigest()[:4], 16) % 3]
-        for k, (w, beat) in enumerate(zip(words, beats)):
-            if w not in words_cache:
-                mp3 = OUT / f"w_{len(words_cache)}.mp3"
-                words_cache[w] = clean_wav(mp3) if tts_line(w, mp3) else None
-            wav = words_cache[w]
-            if wav is None:
-                continue
-            try:
-                if w not in f0_cache:
-                    f0_cache[w] = estimate_f0(read_wav(wav))
-                f0 = f0_cache[w]
-                nxt = beats[k + 1] if k + 1 < len(beats) else 8
-                max_len = (nxt - beat) * BEAT - 0.06
-                chord = CHORD_TONES[(2 * i + beat // 4) % 4]
-                if f0:
-                    tone = chord[contour[k % len(contour)]]
-                    target = tone * 2 ** round(math.log2(f0 / tone))
-                    ratio = float(np.clip(target / f0, 0.7, 1.45))
+def find_syllables(x):
+    """Split a speech signal into syllable chunks at energy valleys. Returns [(start, end)] in samples."""
+    hop = int(0.01 * SR)
+    n = len(x) // hop
+    if n < 8:
+        return [(0, len(x))]
+    rms = np.sqrt(np.mean(x[:n * hop].reshape(n, hop) ** 2, axis=1))
+    env = np.convolve(rms, np.ones(5) / 5, "same")
+    thr = 0.12 * env.max()
+    peaks = [i for i in range(1, n - 1) if env[i] >= env[i - 1] and env[i] > env[i + 1] and env[i] > thr]
+    keep = []
+    for p in peaks:
+        if keep and p - keep[-1] < 11:
+            if env[p] > env[keep[-1]]:
+                keep[-1] = p
+        else:
+            keep.append(p)
+    merged = True
+    while merged and len(keep) > 1:
+        merged = False
+        for j in range(len(keep) - 1):
+            v = keep[j] + int(np.argmin(env[keep[j]:keep[j + 1] + 1]))
+            if env[v] > 0.7 * min(env[keep[j]], env[keep[j + 1]]):
+                if env[keep[j]] >= env[keep[j + 1]]:
+                    del keep[j + 1]
                 else:
-                    ratio = 1.0
-                voices.append((i * SCENE_SECONDS + beat * BEAT + 0.04, sing_word(wav, ratio, max_len)))
-                ok_words += 1
-            except Exception as e:
-                log(f"word '{w}' skipped: {e}")
-    log("sung words:", ok_words)
-    return voices
+                    del keep[j]
+                merged = True
+                break
+    if not keep:
+        return [(0, len(x))]
+    cuts = [0]
+    for j in range(len(keep) - 1):
+        cuts.append(keep[j] + int(np.argmin(env[keep[j]:keep[j + 1] + 1])))
+    cuts.append(n)
+    return [(cuts[j] * hop, min(len(x), cuts[j + 1] * hop)) for j in range(len(cuts) - 1)]
+
+
+def shift_stretch(x, ratio, stretch, vibrato=False):
+    """Change pitch by `ratio` (keeping the voice timbre) and duration by `stretch`."""
+    src = OUT / "chunk_in.wav"; dst = OUT / "chunk_out.wav"
+    write_wav(src, x)
+    tail = ",vibrato=f=5.5:d=0.07" if vibrato else ""
+    try:
+        run(["ffmpeg", "-y", "-i", str(src), "-af",
+             f"rubberband=pitch={ratio:.4f}:tempo={1 / stretch:.4f}:formant=preserved:transients=smooth{tail}",
+             str(dst)])
+    except Exception:
+        tempo = 1 / (ratio * stretch)
+        chain = []
+        while tempo > 2.0:
+            chain.append("atempo=2.0"); tempo /= 2.0
+        while tempo < 0.5:
+            chain.append("atempo=0.5"); tempo /= 0.5
+        chain.append(f"atempo={tempo:.4f}")
+        run(["ffmpeg", "-y", "-i", str(src), "-af",
+             f"asetrate={SR * ratio:.1f},aresample={SR}," + ",".join(chain), str(dst)])
+    y = read_wav(dst)
+    k = min(len(y) // 4, int(0.01 * SR))
+    if k > 0:
+        y[:k] *= np.linspace(0, 1, k); y[-k:] *= np.linspace(1, 0, k)
+    return y
+
+
+# pentatonic melody (G A C D E G) in the natural range of the voice, and a few singable patterns
+SCALE = [196.00, 220.00, 261.63, 293.66, 329.63, 392.00]
+PATTERNS = [[0, 1, 2, 3, 2, 1, 2, 0], [2, 3, 4, 3, 2, 1, 0, 1], [0, 2, 3, 2, 4, 3, 2, 0], [3, 2, 1, 2, 3, 4, 3, 2]]
+CHORD_ROOTS = [261.63, 220.00, 174.61, 196.00]          # C Am F G, like the music
+
+
+def note_for(k, n, pattern, chord_root):
+    if k == n - 1:                                       # last syllable rests on the chord root
+        f = chord_root
+        while f < 196: f *= 2
+        while f > 392: f /= 2
+        return f
+    return SCALE[pattern[k % len(pattern)]]
+
+
+def positions(n):
+    """Start of each syllable inside a 2-bar scene, in eighth notes (0..15)."""
+    return [int(k * 15 / n) if n > 1 else 0 for k in range(n)]
+
+
+def sing_line(wav, scene_idx, text):
+    """Pitch every syllable of one spoken line onto a melody note and hold it on the beat."""
+    x = read_wav(wav)
+    syl = find_syllables(x)[:14]
+    n = len(syl)
+    pat = PATTERNS[int(hashlib.md5(text.encode()).hexdigest()[:4], 16) % len(PATTERNS)]
+    root = CHORD_ROOTS[(2 * scene_idx + 1) % 4]
+    f_line = estimate_f0(x) or 210.0
+    pos = positions(n)
+    buf = np.zeros(int(SCENE_SECONDS * SR) + SR)
+    notes = []
+    for k, (a, b) in enumerate(syl):
+        seg = x[a:b]
+        if len(seg) < int(0.05 * SR):
+            continue
+        f0 = estimate_f0(seg) or f_line
+        target = note_for(k, n, pat, root)
+        ratio = float(np.clip(target / f0, 0.6, 2.0))
+        nxt = pos[k + 1] if k + 1 < n else 16
+        hold = max(0.25, (nxt - pos[k]) * BEAT / 2 - 0.03)
+        nat = len(seg) / SR
+        stretch = float(np.clip(hold / nat, 0.8, 3.0))
+        y = shift_stretch(seg, ratio, stretch, vibrato=stretch > 1.8)
+        start = int(max(0, pos[k] * BEAT / 2 - 0.05) * SR)
+        buf[start:start + len(y)] += y[:len(buf) - start]
+        notes.append((pos[k] * BEAT / 2, min(hold, len(y) / SR), target))
+    peak = np.abs(buf).max()
+    if peak <= 0 or not notes:
+        raise RuntimeError("empty line")
+    return buf / peak * 0.9, notes
 
 
 def fit_line(wav, lo=2.3, hi=3.5):
-    """Stretch/compress a sung line so it fills 2.3-3.5 s of its 4 s scene, add a little echo."""
+    """Fallback: plain spoken line stretched into the scene."""
     data = read_wav(wav)
     dur = len(data) / SR
     target = min(max(dur, lo), hi)
@@ -490,33 +540,68 @@ def fit_line(wav, lo=2.3, hi=3.5):
     out = Path(str(wav) + ".fit.wav")
     run(["ffmpeg", "-y", "-i", str(wav), "-af", f"atempo={tempo:.4f},aecho=0.8:0.6:45:0.25", str(out)])
     y = read_wav(out)
-    n = min(len(y), int(0.02 * SR))
-    if n > 0:
-        y[:n] *= np.linspace(0, 1, n); y[-n:] *= np.linspace(1, 0, n)
     peak = np.abs(y).max()
     return y / peak * 0.9 if peak > 0 else y
 
 
+def words_only_notes(text, scene_idx):
+    """No voice available: still give the scene a melody (about 2 notes per word)."""
+    n = max(2, len(text.split()) * 2)
+    pat = PATTERNS[int(hashlib.md5(text.encode()).hexdigest()[:4], 16) % len(PATTERNS)]
+    root = CHORD_ROOTS[(2 * scene_idx + 1) % 4]
+    pos = positions(n)
+    notes = []
+    for k in range(n):
+        nxt = pos[k + 1] if k + 1 < n else 16
+        notes.append((pos[k] * BEAT / 2, max(0.25, (nxt - pos[k]) * BEAT / 2 - 0.03), note_for(k, n, pat, root)))
+    return notes
+
+
 def make_voices(story):
-    """Whole line with natural prosody, slowed down and lifted in pitch, one line per scene (chant-song)."""
-    if os.getenv("VOICE_MODE", "line") == "words":
-        return make_voices_words(story)
-    voices, cache = [], {}
+    """Returns (voices, leads): sung lines placed on their scene + melody notes for a lead instrument."""
+    voices, leads, cache = [], [], {}
     for i, sc in enumerate(story["scenes"]):
         text = sc.get("lyric_ar", "")
         if not text:
             continue
         if text not in cache:
             mp3 = OUT / f"line_{len(cache)}.mp3"
+            audio, notes = None, None
             try:
-                ok = tts_line(text, mp3, rate="-22%", pitch="+30Hz")
-                cache[text] = fit_line(clean_wav(mp3)) if ok else None
+                if tts_line(text, mp3, rate="-10%", pitch="+0Hz"):
+                    wav = clean_wav(mp3)
+                    try:
+                        audio, notes = sing_line(wav, i, text)
+                    except Exception as e:
+                        log(f"sing line {i} failed ({e}); using spoken fallback")
+                        audio = fit_line(wav)
+                        notes = words_only_notes(text, i)
             except Exception as e:
-                log(f"voice {i} failed: {e}"); cache[text] = None
-        if cache[text] is not None:
-            voices.append((i * SCENE_SECONDS + 0.15, cache[text]))
+                log(f"voice {i} failed: {e}")
+            if notes is None:
+                notes = words_only_notes(text, i)
+            cache[text] = (audio, notes)
+        audio, notes = cache[text]
+        if audio is not None:
+            voices.append((i * SCENE_SECONDS, audio))
+        leads.extend((i * SCENE_SECONDS + t, d, f) for t, d, f in notes)
     log("sung lines:", len(voices), "/", SCENES)
-    return voices
+    return voices, leads
+
+
+def _lead(f, dur):
+    n = int(dur * SR); t = np.arange(n) / SR
+    vib = 1 + 0.004 * np.sin(2 * math.pi * 5.5 * t) * np.minimum(1, t * 4)
+    ph = 2 * math.pi * np.cumsum(f * vib) / SR
+    s = np.sin(ph) + 0.25 * np.sin(2 * ph) + 0.08 * np.sin(3 * ph)
+    return s * np.minimum(1, t * 60) * np.clip((dur - t) * 25, 0, 1)
+
+
+def add_leads(music, leads, gain):
+    buf = music.astype(np.float64).copy()
+    for t, d, f in leads:
+        _add(buf, t, _lead(f, d), gain)
+    return buf.astype(np.float32)
 
 
 def mix_audio(music, voices):
@@ -610,7 +695,8 @@ def main():
     imgs = make_images(story)
     texted = add_lyrics_all(story, imgs)
     music = make_music(story["title_en"])
-    voices = make_voices(story)
+    voices, leads = make_voices(story)
+    music = add_leads(music, leads, 0.30 if voices else 0.45)
     mix = mix_audio(music, voices)
     mp = image_map()
     video = make_video(texted, mix, [i > 0 and mp[i] == mp[i - 1] for i in range(SCENES)]); log("video ready", video)
